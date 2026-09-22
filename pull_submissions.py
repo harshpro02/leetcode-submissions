@@ -35,6 +35,11 @@ ENV = ROOT / ".env"
 API = "https://leetcode.com/api/submissions/"
 GRAPHQL = "https://leetcode.com/graphql"
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
 EXT = {
     "python": "py", "python3": "py", "java": "java", "cpp": "cpp", "c": "c",
     "csharp": "cs", "javascript": "js", "typescript": "ts", "golang": "go",
@@ -74,18 +79,36 @@ def load_env():
 
 
 def request(url, session, csrf, data=None):
+    # Cloudflare rejects requests that do not look like a browser, with a 403
+    # that is easily mistaken for an expired cookie. Send the full header set.
     headers = {
         "Cookie": "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf,
-        "Referer": "https://leetcode.com",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://leetcode.com/submissions/",
+        "Origin": "https://leetcode.com",
         "x-csrftoken": csrf,
     }
     if data is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(data).encode()
-    req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return json.load(response)
+
+    # LeetCode throttles this endpoint and answers 403, which looks exactly like
+    # a rejected cookie. Retry with backoff before concluding the session died.
+    delay = 2.0
+    for attempt in range(5):
+        req = urllib.request.Request(url, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 429) and attempt < 4:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
 def fetch_submissions(session, csrf, limit):
@@ -98,9 +121,10 @@ def fetch_submissions(session, csrf, limit):
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 sys.exit(
-                    "LeetCode rejected the session cookie (HTTP " + str(exc.code)
-                    + ").\nLEETCODE_SESSION has almost certainly expired. "
-                    "Copy a fresh one from your browser into .env."
+                    "LeetCode rejected the request (HTTP " + str(exc.code)
+                    + ") after retrying.\nEither LEETCODE_SESSION has expired, "
+                    "in which case copy a fresh one into .env, or you are being\n"
+                    "rate limited, in which case wait a few minutes and re-run."
                 )
             raise
         dump = body.get("submissions_dump", [])
@@ -113,7 +137,7 @@ def fetch_submissions(session, csrf, limit):
         if not body.get("has_next"):
             break
         offset += page
-        time.sleep(0.4)
+        time.sleep(1.5)
     return seen
 
 
@@ -142,7 +166,7 @@ def describe(slug):
     payload = json.dumps({"query": query, "variables": {"titleSlug": slug}}).encode()
     req = urllib.request.Request(
         GRAPHQL, data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0",
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT,
                  "Referer": "https://leetcode.com"},
     )
     with urllib.request.urlopen(req, timeout=20) as response:
